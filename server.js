@@ -1,258 +1,229 @@
 /**
- * server.js — FileConvert Pro Backend
- *
- * Что делает этот сервер:
- * 1. Принимает файл от расширения
- * 2. Проксирует его в ConvertAPI (ключ хранится здесь, не в расширении)
- * 3. Возвращает готовый файл расширению
- * 4. Принимает webhook от Prodamus после оплаты
- * 5. Отдаёт баланс кредитов расширению
- *
- * Чтобы сменить ключ ConvertAPI — просто измени CONVERTAPI_SECRET
- * в переменных окружения Railway. Расширение обновлять не нужно.
+ * server.js — FileConvert Pro Backend v2
+ * Упрощённая версия — решает проблему с возвратом файла от ConvertAPI
  */
 
-const express    = require("express");
-const cors       = require("cors");
-const multer     = require("multer");
-const fetch      = require("node-fetch");
-const FormData   = require("form-data");
-const rateLimit  = require("express-rate-limit");
+const express   = require("express");
+const cors      = require("cors");
+const multer    = require("multer");
+const https     = require("https");
+const http      = require("http");
+const FormData  = require("form-data");
 
-// ─── Config из переменных окружения ──────────────────────────────────────────
 const CONFIG = {
-  PORT:               process.env.PORT || 3000,
-  CONVERTAPI_SECRET:  process.env.CONVERTAPI_SECRET || "",
-  CONVERTAPI_BASE:    "https://v2.convertapi.com/convert",
-  PRODAMUS_SECRET:    process.env.PRODAMUS_SECRET || "",  // секрет для проверки webhook
-  MAX_FILE_MB:        parseInt(process.env.MAX_FILE_MB) || 200,
+  PORT:              process.env.PORT || 3000,
+  CONVERTAPI_SECRET: process.env.CONVERTAPI_SECRET || "",
+  CONVERTAPI_BASE:   "v2.convertapi.com",
+  MAX_FILE_MB:       parseInt(process.env.MAX_FILE_MB) || 200,
 };
 
-// ─── Кредиты пользователей (в памяти — для старта достаточно) ────────────────
-// В продакшне замени на базу данных (PostgreSQL на Railway)
-const credits = new Map();  // licenseKey → { credits, plan, email }
+// Кредиты пользователей (в памяти)
+const users = new Map();
 
 function getUser(key) {
-  if (!credits.has(key)) {
-    credits.set(key, { credits: 10, plan: "free", email: "" });
+  if (!users.has(key)) {
+    users.set(key, { credits: 10, plan: "free" });
   }
-  return credits.get(key);
+  return users.get(key);
 }
 
-// ─── Express setup ────────────────────────────────────────────────────────────
 const app = express();
 app.set("trust proxy", 1);
 
 app.use(cors({
-  origin: "*",  // Разрешаем запросы от Chrome Extension
-  exposedHeaders: ["X-Output-Filename", "X-Output-Size", "X-Credits-Left"],
+  origin: "*",
+  exposedHeaders: ["X-Output-Filename", "X-Output-Size", "X-Credits-Left", "Content-Disposition"],
 }));
 
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// ─── Multer (приём файлов) ────────────────────────────────────────────────────
+// Multer — храним файл в памяти
 const upload = multer({
-  storage: multer.memoryStorage(),  // храним файл в памяти (не на диске)
+  storage: multer.memoryStorage(),
   limits:  { fileSize: CONFIG.MAX_FILE_MB * 1024 * 1024 },
 });
 
-// ─── Rate limiting ────────────────────────────────────────────────────────────
-const limiter = rateLimit({
-  windowMs: 60 * 1000,  // 1 минута
-  max: 20,              // макс 20 запросов с одного IP в минуту
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, error: "Too many requests. Please wait a moment." },
-});
-
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-
-function sendError(res, status, message) {
-  return res.status(status).json({ success: false, error: message });
-}
-
-// Сколько кредитов стоит конвертация (можно настроить по форматам)
-function getCost(fromExt, toExt) {
-  return 1; // пока всё стоит 1 кредит
-}
-
-// ─── ROUTES ───────────────────────────────────────────────────────────────────
-
-// Проверка работы сервера
+// ── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
-    success: true,
-    status:  "running",
-    version: "1.0.0",
+    success:   true,
+    status:    "running",
+    version:   "2.0.0",
     hasApiKey: !!CONFIG.CONVERTAPI_SECRET,
   });
 });
 
-// ── Получить баланс кредитов ─────────────────────────────────────────────────
+// ── Balance ───────────────────────────────────────────────────────────────────
 app.get("/balance", (req, res) => {
-  const key  = req.headers["x-license-key"] || req.query.key || "free";
+  const key  = req.headers["x-license-key"] || "free";
   const user = getUser(key);
-  res.json({
-    success: true,
-    credits: user.credits,
-    plan:    user.plan,
-  });
+  res.json({ success: true, credits: user.credits, plan: user.plan });
 });
 
-// ── Конвертация файла ────────────────────────────────────────────────────────
-app.post("/convert/:from/to/:to", limiter, upload.single("File"), async (req, res) => {
+// ── Convert ───────────────────────────────────────────────────────────────────
+app.post("/convert/:from/to/:to", upload.single("File"), async (req, res) => {
   const { from, to } = req.params;
   const licenseKey   = req.headers["x-license-key"] || "free";
 
-  // Проверяем файл
   if (!req.file) {
-    return sendError(res, 400, "No file uploaded.");
+    return res.status(400).json({ success: false, error: "No file uploaded." });
   }
 
-  // Проверяем кредиты
   const user = getUser(licenseKey);
-  const cost = getCost(from, to);
-
-  if (user.credits < cost) {
-    return sendError(res, 402, "Not enough credits. Please purchase a pack.");
+  if (user.credits < 1) {
+    return res.status(402).json({ success: false, error: "Not enough credits. Please purchase a pack." });
   }
 
-  // Проверяем API ключ
   if (!CONFIG.CONVERTAPI_SECRET) {
-    return sendError(res, 500, "API key not configured on server.");
+    return res.status(500).json({ success: false, error: "API key not configured." });
   }
 
   try {
-    // Пересылаем файл в ConvertAPI
-    const formData = new FormData();
-    formData.append("File", req.file.buffer, {
-      filename:    req.file.originalname,
-      contentType: req.file.mimetype,
-    });
+    // Шаг 1: Отправляем файл в ConvertAPI через multipart form
+    const result = await sendToConvertAPI(req.file, from, to);
 
-    const apiUrl  = `${CONFIG.CONVERTAPI_BASE}/${from}/to/${to}?Secret=${CONFIG.CONVERTAPI_SECRET}`;
-    const apiResp = await fetch(apiUrl, {
-      method:  "POST",
-      body:    formData,
-      headers: formData.getHeaders(),
-      timeout: 120000,  // 2 минуты таймаут
-    });
-
-    const data = await apiResp.json();
-
-    if (!apiResp.ok || data.Code !== 200) {
-      // Обрабатываем ошибки ConvertAPI
-      if (apiResp.status === 401 || apiResp.status === 403) {
-        return sendError(res, 500, "Invalid ConvertAPI key. Contact support.");
-      }
-      if (apiResp.status === 429) {
-        return sendError(res, 429, "Conversion limit reached. Please try again later.");
-      }
-      return sendError(res, 500, data.Message || "Conversion failed.");
+    if (!result.success) {
+      return res.status(500).json({ success: false, error: result.error });
     }
 
-    if (!data.Files?.[0]) {
-      return sendError(res, 500, "No output file returned from conversion service.");
-    }
+    // Шаг 2: Скачиваем готовый файл
+    const fileBuffer = await downloadFile(result.url);
 
-    // Списываем кредит только после успешной конвертации
-    user.credits -= cost;
+    // Шаг 3: Списываем кредит
+    user.credits -= 1;
 
-    // Получаем выходной файл
-    const outputFile = data.Files[0];
-    const outputName = outputFile.FileName ||
-      req.file.originalname.replace(/\.[^.]+$/, "") + "." + to;
+    // Шаг 4: Отправляем файл пользователю
+    const outputName = req.file.originalname.replace(/\.[^.]+$/, "") + "." + to;
 
-    // Если ConvertAPI вернул URL — скачиваем файл и отдаём пользователю
-    if (outputFile.Url) {
-      const fileResp = await fetch(outputFile.Url);
-      if (!fileResp.ok) {
-        return sendError(res, 500, "Could not download converted file.");
-      }
-
-      const buffer = await fileResp.buffer();
-
-      res.setHeader("Content-Type", fileResp.headers.get("content-type") || "application/octet-stream");
-      res.setHeader("Content-Disposition", `attachment; filename="${outputName}"`);
-      res.setHeader("Content-Length", buffer.length);
-      res.setHeader("X-Output-Filename", outputName);
-      res.setHeader("X-Output-Size", buffer.length);
-      res.setHeader("X-Credits-Left", user.credits);
-      return res.send(buffer);
-    }
-
-    // Если ConvertAPI вернул base64
-    if (outputFile.FileData) {
-      const buffer = Buffer.from(outputFile.FileData, "base64");
-
-      res.setHeader("Content-Type", "application/octet-stream");
-      res.setHeader("Content-Disposition", `attachment; filename="${outputName}"`);
-      res.setHeader("Content-Length", buffer.length);
-      res.setHeader("X-Output-Filename", outputName);
-      res.setHeader("X-Output-Size", buffer.length);
-      res.setHeader("X-Credits-Left", user.credits);
-      return res.send(buffer);
-    }
-
-    return sendError(res, 500, "Unexpected response from conversion service.");
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename="${outputName}"`);
+    res.setHeader("Content-Length", fileBuffer.length);
+    res.setHeader("X-Output-Filename", outputName);
+    res.setHeader("X-Output-Size", fileBuffer.length);
+    res.setHeader("X-Credits-Left", user.credits);
+    return res.send(fileBuffer);
 
   } catch (err) {
     console.error("[Convert Error]", err.message);
-    if (err.type === "request-timeout") {
-      return sendError(res, 504, "Conversion timed out. Try a smaller file.");
-    }
-    return sendError(res, 500, "Server error. Please try again.");
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── Webhook от Prodamus (зачисление кредитов после оплаты) ───────────────────
-app.post("/webhook/prodamus", async (req, res) => {
+// ── Prodamus Webhook ──────────────────────────────────────────────────────────
+app.post("/webhook/prodamus", express.urlencoded({ extended: true }), (req, res) => {
   try {
-    const body = req.body;
-
-    console.log("[Prodamus Webhook]", JSON.stringify(body));
-
-    // Prodamus присылает: payment_status, order_id, customer_email, sum и др.
+    const body   = req.body;
     const status = body.payment_status;
     const email  = body.customer_email || body.email || "";
     const sum    = parseFloat(body.sum || body.order_sum || 0);
 
-    // Принимаем только успешные оплаты
-    if (status !== "paid") {
-      return res.status(200).send("OK");  // Всегда отвечаем 200 чтобы Prodamus не повторял
+    console.log("[Prodamus]", { status, email, sum });
+
+    if (status === "paid") {
+      const pack = detectPack(sum);
+      if (pack && email) {
+        const user    = getUser(email);
+        user.credits += pack.credits;
+        user.plan     = pack.plan;
+        users.set(email, user);
+        console.log(`[Prodamus] +${pack.credits} credits for ${email}`);
+      }
     }
-
-    // Определяем пакет по сумме
-    const pack = detectPack(sum);
-    if (!pack) {
-      console.warn("[Prodamus] Unknown sum:", sum);
-      return res.status(200).send("OK");
-    }
-
-    // Зачисляем кредиты
-    // Ключ лицензии = email пользователя (простой вариант для старта)
-    const user = getUser(email);
-    user.credits += pack.credits;
-    user.plan     = pack.plan;
-    user.email    = email;
-    credits.set(email, user);
-
-    console.log(`[Prodamus] +${pack.credits} credits for ${email}. Total: ${user.credits}`);
-
-    // Prodamus ожидает HTTP 200 в ответ
     return res.status(200).send("OK");
-
   } catch (err) {
     console.error("[Webhook Error]", err.message);
-    // Даже при ошибке отвечаем 200 — иначе Prodamus будет повторять webhook бесконечно
     return res.status(200).send("OK");
   }
 });
 
-// ─── Определение пакета по сумме оплаты ──────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Отправка файла в ConvertAPI, возвращает URL готового файла
+function sendToConvertAPI(file, from, to) {
+  return new Promise((resolve) => {
+    const form = new FormData();
+    form.append("File", file.buffer, {
+      filename:    file.originalname,
+      contentType: file.mimetype,
+    });
+
+    const path    = `/convert/${from}/to/${to}?Secret=${CONFIG.CONVERTAPI_SECRET}`;
+    const headers = form.getHeaders();
+    const options = {
+      hostname: CONFIG.CONVERTAPI_BASE,
+      path,
+      method:   "POST",
+      headers:  { ...headers, "Content-Length": form.getLengthSync() },
+      timeout:  120000,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+
+          if (res.statusCode !== 200 || json.Code !== 200) {
+            if (res.statusCode === 401 || res.statusCode === 403) {
+              return resolve({ success: false, error: "Invalid ConvertAPI key." });
+            }
+            if (res.statusCode === 429) {
+              return resolve({ success: false, error: "ConvertAPI limit reached." });
+            }
+            return resolve({ success: false, error: json.Message || `ConvertAPI error (${res.statusCode})` });
+          }
+
+          if (!json.Files || !json.Files[0]) {
+            return resolve({ success: false, error: "No output file from ConvertAPI." });
+          }
+
+          // Возвращаем URL или base64
+          if (json.Files[0].Url) {
+            return resolve({ success: true, url: json.Files[0].Url, type: "url" });
+          }
+          if (json.Files[0].FileData) {
+            return resolve({ success: true, data: json.Files[0].FileData, type: "base64" });
+          }
+
+          return resolve({ success: false, error: "Unexpected ConvertAPI response." });
+
+        } catch (e) {
+          return resolve({ success: false, error: "Failed to parse ConvertAPI response." });
+        }
+      });
+    });
+
+    req.on("error",   (e) => resolve({ success: false, error: e.message }));
+    req.on("timeout", ()  => { req.destroy(); resolve({ success: false, error: "ConvertAPI timeout." }); });
+
+    form.pipe(req);
+  });
+}
+
+// Скачивание готового файла по URL
+function downloadFile(url) {
+  return new Promise((resolve, reject) => {
+    // Определяем http или https
+    const lib     = url.startsWith("https") ? https : http;
+    const chunks  = [];
+
+    lib.get(url, (res) => {
+      // Обрабатываем редиректы
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        return downloadFile(res.headers.location).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+      }
+      res.on("data",  chunk => chunks.push(chunk));
+      res.on("end",   ()    => resolve(Buffer.concat(chunks)));
+      res.on("error", err   => reject(err));
+    }).on("error", err => reject(err));
+  });
+}
+
 function detectPack(sum) {
-  // Допуск ±0.5 для учёта комиссий
   if (Math.abs(sum - 2.99)  < 0.5) return { plan: "micro",    credits: 25   };
   if (Math.abs(sum - 7.99)  < 0.5) return { plan: "standard", credits: 100  };
   if (Math.abs(sum - 17.99) < 0.5) return { plan: "pro",      credits: 300  };
@@ -260,17 +231,9 @@ function detectPack(sum) {
   return null;
 }
 
-// ─── 404 ──────────────────────────────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ success: false, error: "Endpoint not found." });
-});
+app.use((req, res) => res.status(404).json({ success: false, error: "Not found." }));
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(CONFIG.PORT, () => {
-  console.log(`✅ FileConvert Server running on port ${CONFIG.PORT}`);
+  console.log(`✅ FileConvert Server v2 running on port ${CONFIG.PORT}`);
   console.log(`   API key configured: ${!!CONFIG.CONVERTAPI_SECRET}`);
-  console.log(`   GET  /health`);
-  console.log(`   GET  /balance`);
-  console.log(`   POST /convert/:from/to/:to`);
-  console.log(`   POST /webhook/prodamus`);
 });
