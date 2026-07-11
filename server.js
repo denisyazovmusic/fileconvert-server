@@ -1,5 +1,6 @@
 /**
- * server.js — FileConvert Pro Backend v3
+ * server.js v5.1
+ * + добавлен /payment/create для e-pay.plus
  */
 
 const express  = require("express");
@@ -13,24 +14,24 @@ const CONFIG = {
   PORT:              process.env.PORT || 3000,
   CONVERTAPI_SECRET: process.env.CONVERTAPI_SECRET || "",
   MAX_FILE_MB:       parseInt(process.env.MAX_FILE_MB) || 200,
+  EPAY_API_KEY:      process.env.EPAY_API_KEY || "",
+  EPAY_URL:          "https://livepay24.click/api/request/",
+  SERVER_URL:        process.env.SERVER_URL || "https://fileconvert-api-4e9p.onrender.com",
+  PACK_AMOUNT:       "1199",
+  PACK_AMOUNT_USD:   "11.99",
+  PACK_CREDITS:      100,
 };
-
-const users = new Map();
-
-function getUser(key) {
-  if (!users.has(key)) users.set(key, { credits: 10, plan: "free" });
-  return users.get(key);
-}
 
 const app = express();
 app.set("trust proxy", 1);
 
 app.use(cors({
   origin: "*",
-  exposedHeaders: ["X-Output-Filename", "X-Output-Size", "X-Credits-Left", "Content-Disposition"],
+  exposedHeaders: ["X-Output-Filename", "X-Output-Size", "Content-Disposition"],
 }));
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -39,103 +40,136 @@ const upload = multer({
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ success: true, status: "running", version: "3.0.0", hasApiKey: !!CONFIG.CONVERTAPI_SECRET });
+  res.json({
+    success:    true,
+    status:     "running",
+    version:    "5.1.0",
+    hasApiKey:  !!CONFIG.CONVERTAPI_SECRET,
+    hasEpayKey: !!CONFIG.EPAY_API_KEY,
+  });
 });
 
-// ── Balance ───────────────────────────────────────────────────────────────────
-app.get("/balance", (req, res) => {
-  const user = getUser(req.headers["x-license-key"] || "free");
-  res.json({ success: true, credits: user.credits, plan: user.plan });
+// ── Create payment link ───────────────────────────────────────────────────────
+app.post("/payment/create", (req, res) => {
+  const licenseKey = req.body.licenseKey || "";
+
+  if (!licenseKey) {
+    return res.status(400).json({ success: false, error: "Email is required." });
+  }
+
+  if (!CONFIG.EPAY_API_KEY) {
+    return res.status(500).json({ success: false, error: "Payment not configured on server." });
+  }
+
+  const orderId = encodeURIComponent(licenseKey) + "_" + Date.now();
+
+  const params = new URLSearchParams({
+    amount:            CONFIG.PACK_AMOUNT,
+    merchant_order_id: orderId,
+    use_card_payment:  "USD",
+    api_key:           CONFIG.EPAY_API_KEY,
+    notice_url:        CONFIG.SERVER_URL + "/webhook/epay",
+    success_url:       CONFIG.SERVER_URL + "/payment/success",
+    fail_url:          CONFIG.SERVER_URL + "/payment/fail",
+  });
+
+  const paymentUrl = CONFIG.EPAY_URL + "?" + params.toString();
+  console.log("[Payment] Created for:", licenseKey, "| URL:", paymentUrl);
+
+  res.json({
+    success:    true,
+    paymentUrl,
+    amount:     CONFIG.PACK_AMOUNT_USD,
+    credits:    CONFIG.PACK_CREDITS,
+  });
+});
+
+// ── Success / Fail pages ──────────────────────────────────────────────────────
+app.get("/payment/success", (req, res) => {
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payment Successful</title>
+  <style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f8fafc}
+  .card{background:#fff;border-radius:16px;padding:40px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:400px}
+  .icon{font-size:48px;margin-bottom:16px}h1{color:#0f172a;font-size:24px;margin:0 0 8px}
+  p{color:#64748b;margin:0 0 16px}.credits{background:#eff6ff;color:#2563eb;font-weight:700;padding:8px 20px;border-radius:8px;display:inline-block;margin-bottom:16px}
+  small{color:#94a3b8;font-size:12px}</style></head>
+  <body><div class="card"><div class="icon">🎉</div><h1>Payment Successful!</h1>
+  <p>Your 100 conversions have been added.</p>
+  <div class="credits">+100 conversions</div>
+  <p><small>You can close this tab and return to the extension.</small></p></div></body></html>`);
+});
+
+app.get("/payment/fail", (req, res) => {
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Payment Failed</title>
+  <style>body{font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f8fafc}
+  .card{background:#fff;border-radius:16px;padding:40px;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,.08);max-width:400px}
+  .icon{font-size:48px;margin-bottom:16px}h1{color:#0f172a;font-size:24px;margin:0 0 8px}p{color:#64748b}</style></head>
+  <body><div class="card"><div class="icon">😕</div><h1>Payment Failed</h1>
+  <p>Something went wrong. Please try again.</p></div></body></html>`);
+});
+
+// ── Webhook from e-pay.plus ───────────────────────────────────────────────────
+app.post("/webhook/epay", (req, res) => {
+  try {
+    const body    = req.body;
+    console.log("[Webhook e-pay]", JSON.stringify(body));
+    // Здесь можно добавить логику зачисления кредитов через БД
+  } catch (err) {
+    console.error("[Webhook Error]", err.message);
+  }
+  return res.status(200).send("OK");
 });
 
 // ── Convert ───────────────────────────────────────────────────────────────────
 app.post("/convert/:from/to/:to", upload.single("File"), async (req, res) => {
   const { from, to } = req.params;
-  const licenseKey   = req.headers["x-license-key"] || "free";
 
-  if (!req.file) return res.status(400).json({ success: false, error: "No file uploaded." });
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: "No file uploaded." });
+  }
 
-  const user = getUser(licenseKey);
-  if (user.credits < 1) return res.status(402).json({ success: false, error: "Not enough credits." });
-  if (!CONFIG.CONVERTAPI_SECRET) return res.status(500).json({ success: false, error: "API key not configured." });
+  if (!CONFIG.CONVERTAPI_SECRET) {
+    return res.status(500).json({ success: false, error: "API key not configured." });
+  }
 
   try {
-    console.log(`[Convert] ${from} → ${to}, file: ${req.file.originalname}, size: ${req.file.size}`);
+    console.log(`[Convert] ${from} → ${to} | ${req.file.originalname} | ${req.file.size} bytes`);
 
-    // Шаг 1: Отправляем в ConvertAPI
     const apiResult = await callConvertAPI(req.file, from, to);
-    console.log("[ConvertAPI Response] Code:", apiResult.Code, "Files:", apiResult.Files?.length);
 
     if (!apiResult.Files || !apiResult.Files[0]) {
-      console.error("[ConvertAPI] No files in response:", JSON.stringify(apiResult));
-      return res.status(500).json({ success: false, error: "ConvertAPI returned no files." });
+      return res.status(500).json({ success: false, error: "ConvertAPI returned no output file." });
     }
 
     const outputFile = apiResult.Files[0];
-    console.log("[ConvertAPI] Output file:", outputFile.FileName, "HasUrl:", !!outputFile.Url, "HasData:", !!outputFile.FileData);
-
-    // Шаг 2: Получаем файл
     let fileBuffer;
 
     if (outputFile.Url) {
-      console.log("[Download] Downloading from URL:", outputFile.Url);
       fileBuffer = await downloadUrl(outputFile.Url);
-      console.log("[Download] Success, size:", fileBuffer.length);
     } else if (outputFile.FileData) {
-      console.log("[Base64] Decoding base64 data");
       fileBuffer = Buffer.from(outputFile.FileData, "base64");
-      console.log("[Base64] Success, size:", fileBuffer.length);
     } else {
-      return res.status(500).json({ success: false, error: "No file data in ConvertAPI response." });
+      return res.status(500).json({ success: false, error: "No file data in response." });
     }
 
-    // Шаг 3: Списываем кредит
-    user.credits -= 1;
-    console.log(`[Credits] ${licenseKey}: ${user.credits} left`);
-
-    // Шаг 4: Отдаём файл
-    const outputName = (outputFile.FileName) ||
+    const outputName = outputFile.FileName ||
       req.file.originalname.replace(/\.[^.]+$/, "") + "." + to;
+
+    console.log(`[Done] ${outputName} | ${fileBuffer.length} bytes`);
 
     res.setHeader("Content-Type", "application/octet-stream");
     res.setHeader("Content-Disposition", `attachment; filename="${outputName}"`);
     res.setHeader("Content-Length", fileBuffer.length);
     res.setHeader("X-Output-Filename", outputName);
     res.setHeader("X-Output-Size", fileBuffer.length);
-    res.setHeader("X-Credits-Left", user.credits);
     return res.send(fileBuffer);
 
   } catch (err) {
-    console.error("[Convert Error]", err.message, err.stack);
+    console.error("[Convert Error]", err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── Webhook Prodamus ──────────────────────────────────────────────────────────
-app.post("/webhook/prodamus", express.urlencoded({ extended: true }), (req, res) => {
-  try {
-    const { payment_status, customer_email, email, sum, order_sum } = req.body;
-    const userEmail = customer_email || email || "";
-    const amount    = parseFloat(sum || order_sum || 0);
-    console.log("[Prodamus]", payment_status, userEmail, amount);
-    if (payment_status === "paid") {
-      const pack = detectPack(amount);
-      if (pack && userEmail) {
-        const user    = getUser(userEmail);
-        user.credits += pack.credits;
-        user.plan     = pack.plan;
-        users.set(userEmail, user);
-        console.log(`[Prodamus] +${pack.credits} for ${userEmail}, total: ${user.credits}`);
-      }
-    }
-  } catch (e) {
-    console.error("[Webhook Error]", e.message);
-  }
-  return res.status(200).send("OK");
-});
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
 function callConvertAPI(file, from, to) {
   return new Promise((resolve, reject) => {
     const form = new FormData();
@@ -157,13 +191,9 @@ function callConvertAPI(file, from, to) {
       res.on("data", c => chunks.push(c));
       res.on("end", () => {
         const raw = Buffer.concat(chunks).toString();
-        console.log("[ConvertAPI Raw] HTTP:", res.statusCode, "Body preview:", raw.substring(0, 300));
-        try {
-          const json = JSON.parse(raw);
-          resolve(json);
-        } catch (e) {
-          reject(new Error("Invalid JSON from ConvertAPI: " + raw.substring(0, 200)));
-        }
+        console.log("[ConvertAPI] HTTP:", res.statusCode, "| Preview:", raw.slice(0, 150));
+        try { resolve(JSON.parse(raw)); }
+        catch (e) { reject(new Error("Invalid JSON from ConvertAPI")); }
       });
     });
 
@@ -188,17 +218,9 @@ function downloadUrl(url) {
   });
 }
 
-function detectPack(sum) {
-  if (Math.abs(sum - 2.99)  < 0.5) return { plan: "micro",    credits: 25   };
-  if (Math.abs(sum - 7.99)  < 0.5) return { plan: "standard", credits: 100  };
-  if (Math.abs(sum - 17.99) < 0.5) return { plan: "pro",      credits: 300  };
-  if (Math.abs(sum - 39.99) < 0.5) return { plan: "business", credits: 1000 };
-  return null;
-}
-
 app.use((req, res) => res.status(404).json({ success: false, error: "Not found." }));
 
 app.listen(CONFIG.PORT, () => {
-  console.log(`✅ FileConvert Server v3 running on port ${CONFIG.PORT}`);
-  console.log(`   API key configured: ${!!CONFIG.CONVERTAPI_SECRET}`);
+  console.log(`✅ FileConvert Server v5.1 running on port ${CONFIG.PORT}`);
+  console.log(`   ConvertAPI: ${!!CONFIG.CONVERTAPI_SECRET} | e-pay: ${!!CONFIG.EPAY_API_KEY}`);
 });
