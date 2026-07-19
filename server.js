@@ -63,22 +63,22 @@ app.post("/payment/create", (req, res) => {
 
   const orderId = encodeURIComponent(licenseKey) + "_" + Date.now();
 
-  const params = new URLSearchParams({
-    amount:            CONFIG.PACK_AMOUNT,
-    merchant_order_id: orderId,
-    use_card_payment:  "USD",
-    api_key:           CONFIG.EPAY_API_KEY,
-    notice_url:        CONFIG.SERVER_URL + "/webhook/epay",
-    success_url:       CONFIG.SERVER_URL + "/payment/success",
-    fail_url:          CONFIG.SERVER_URL + "/payment/fail",
-  });
+  // Возвращаем поля формы — расширение создаст POST форму
+  const formFields = [
+    { name: "amount",            value: CONFIG.PACK_AMOUNT },
+    { name: "merchant_order_id", value: orderId },
+    { name: "use_card_payment",  value: "USD" },
+    { name: "api_key",           value: CONFIG.EPAY_API_KEY },
+    { name: "notice_url",        value: CONFIG.SERVER_URL + "/webhook/epay" },
+    { name: "success_url",       value: CONFIG.SERVER_URL + "/payment/success" },
+    { name: "fail_url",          value: CONFIG.SERVER_URL + "/payment/fail" },
+  ];
 
-  const paymentUrl = CONFIG.EPAY_URL + "?" + params.toString();
-  console.log("[Payment] Created for:", licenseKey, "| URL:", paymentUrl);
+  console.log("[Payment] Created for:", licenseKey, "| OrderId:", orderId);
 
   res.json({
     success:    true,
-    paymentUrl,
+    formFields,
     amount:     CONFIG.PACK_AMOUNT_USD,
     credits:    CONFIG.PACK_CREDITS,
   });
@@ -151,15 +151,23 @@ app.post("/convert/:from/to/:to", upload.single("File"), async (req, res) => {
       return res.status(500).json({ success: false, error: "No file data in response." });
     }
 
-    const outputName = outputFile.FileName ||
+    // Sanitize filename — remove UUID prefix, encode for headers
+    const rawName = outputFile.FileName ||
       req.file.originalname.replace(/\.[^.]+$/, "") + "." + to;
 
-    console.log(`[Done] ${outputName} | ${fileBuffer.length} bytes`);
+    // Remove UUID prefix if present (format: uuid-originalname)
+    const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i;
+    const cleanName = rawName.replace(uuidPattern, "");
+
+    // Safe ASCII filename for Content-Disposition header
+    const safeName = encodeURIComponent(cleanName);
+
+    console.log(`[Done] ${cleanName} | ${fileBuffer.length} bytes`);
 
     res.setHeader("Content-Type", "application/octet-stream");
-    res.setHeader("Content-Disposition", `attachment; filename="${outputName}"`);
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8\'\'${safeName}`);
     res.setHeader("Content-Length", fileBuffer.length);
-    res.setHeader("X-Output-Filename", outputName);
+    res.setHeader("X-Output-Filename", cleanName);
     res.setHeader("X-Output-Size", fileBuffer.length);
     return res.send(fileBuffer);
 
