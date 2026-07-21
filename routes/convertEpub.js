@@ -27,7 +27,7 @@ const TMP_DIR = path.join(os.tmpdir(), "pdf-to-epub-uploads");
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
 const ALLOWED_EXT = [".pdf", ".docx", ".doc", ".txt", ".html", ".htm"];
-const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
+const MAX_FILE_SIZE = (parseInt(process.env.MAX_FILE_MB) || 200) * 1024 * 1024; // берём тот же лимит, что и в server.js (CONFIG.MAX_FILE_MB)
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, TMP_DIR),
