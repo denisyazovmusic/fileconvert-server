@@ -9,7 +9,6 @@ const multer   = require("multer");
 const https    = require("https");
 const http     = require("http");
 const FormData = require("form-data");
-const convertEpubRouter = require("./routes/convertEpub");
 
 const CONFIG = {
   PORT:              process.env.PORT || 3000,
@@ -33,7 +32,6 @@ app.use(cors({
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use("/api", convertEpubRouter);
 
 const upload = multer({
   storage: multer.memoryStorage(),
